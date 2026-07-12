@@ -24,6 +24,7 @@ import (
 )
 
 import (
+	"github.com/apache/dubbo-go-pixiu/pkg/cluster"
 	_ "github.com/apache/dubbo-go-pixiu/pkg/cluster/loadbalancer/maglev"     // Register Maglev for benchmark coverage.
 	_ "github.com/apache/dubbo-go-pixiu/pkg/cluster/loadbalancer/rand"       // Register Rand for benchmark coverage.
 	_ "github.com/apache/dubbo-go-pixiu/pkg/cluster/loadbalancer/ringhash"   // Register RingHash for benchmark coverage.
@@ -33,9 +34,10 @@ import (
 
 var (
 	// Keep benchmark results live so the compiler cannot optimize the hot path away.
-	benchmarkEndpointSink  *model.Endpoint
-	benchmarkEndpointsSink []*model.Endpoint
-	benchmarkClusterSink   *model.ClusterConfig
+	benchmarkEndpointSink       *model.Endpoint
+	benchmarkEndpointsSink      []*model.Endpoint
+	benchmarkClusterSink        *model.ClusterConfig
+	benchmarkConsistentHashSink model.LbConsistentHashView
 )
 
 type benchmarkHashPolicy string
@@ -106,35 +108,94 @@ func BenchmarkClusterLoadBalancerHotPathSerial(b *testing.B) {
 		for _, endpointCount := range []int{4, 64, 512} {
 			b.Run(fmt.Sprintf("%s/endpoints=%d", lbType, endpointCount), func(b *testing.B) {
 				cm := &ClusterManager{}
-				cluster := benchmarkClusterConfig("lb-hot-path", lbType, endpointCount, 0)
+				runtimeCluster := cluster.NewCluster(benchmarkClusterConfig("lb-hot-path", lbType, endpointCount, 0))
 
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					benchmarkEndpointSink = cm.pickOneEndpoint(cluster, nil)
+					benchmarkEndpointSink = cm.pickOneEndpoint(runtimeCluster, nil)
 				}
 			})
 		}
 	}
 }
 
-func BenchmarkClusterHealthyFilterCost(b *testing.B) {
+// BenchmarkClusterHealthySnapshotLoad measures the per-request endpoint
+// retrieval cost on the snapshot pick path. The request path uses
+// HealthyEndpointsForPick (zero-copy: returns the snapshot-owned slice),
+// not HealthyEndpoints (defensive deep copy). This is the bench that
+// backs the CHANGELOG claim "O(1) on the healthy view".
+//
+// HealthyEndpoints is also benchmarked below for comparison — it is what
+// external code that needs an isolated slice should use, and it shows
+// the cost of the defensive copy (allocation = endpointCount + maps).
+func BenchmarkClusterHealthySnapshotLoad(b *testing.B) {
+	benchmarkHealthySnapshotAccessor(b, "healthy-snapshot", (*cluster.EndpointSnapshot).HealthyEndpointsForPick)
+}
+
+// BenchmarkClusterHealthySnapshotDefensiveCopy measures the cost of the
+// defensive HealthyEndpoints accessor. Reported separately so external
+// callers that need an isolated slice see the price.
+func BenchmarkClusterHealthySnapshotDefensiveCopy(b *testing.B) {
+	benchmarkHealthySnapshotAccessor(b, "healthy-snapshot-copy", (*cluster.EndpointSnapshot).HealthyEndpoints)
+}
+
+func benchmarkHealthySnapshotAccessor(
+	b *testing.B,
+	clusterName string,
+	accessor func(*cluster.EndpointSnapshot) []*model.Endpoint,
+) {
 	for _, endpointCount := range []int{8, 64, 512} {
 		for _, healthyRatio := range []int{100, 50, 0} {
 			b.Run(fmt.Sprintf("endpoints=%d/healthy=%d", endpointCount, healthyRatio), func(b *testing.B) {
-				cluster := benchmarkClusterConfig("healthy-filter", model.LoadBalancerRoundRobin, endpointCount, 0)
+				clusterConfig := benchmarkClusterConfig(clusterName, model.LoadBalancerRoundRobin, endpointCount, 0)
 				healthyCount := endpointCount * healthyRatio / 100
-				for i := healthyCount; i < len(cluster.Endpoints); i++ {
-					cluster.Endpoints[i].UnHealthy = true
+				for i := healthyCount; i < len(clusterConfig.Endpoints); i++ {
+					clusterConfig.Endpoints[i].UnHealthy = true
 				}
+				runtimeCluster := cluster.NewCluster(clusterConfig)
+				snapshot := runtimeCluster.EndpointSnapshot()
 
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					benchmarkEndpointsSink = cluster.GetEndpoint(true)
+					benchmarkEndpointsSink = accessor(snapshot)
 				}
 			})
 		}
+	}
+}
+
+func BenchmarkClusterSetEndpointMembershipChurn(b *testing.B) {
+	endpointCount := 1000
+	clusterName := "endpoint-churn"
+
+	clusterConfig := benchmarkClusterConfig(clusterName, model.LoadBalancerRoundRobin, endpointCount, 0)
+	for _, endpoint := range clusterConfig.Endpoints {
+		endpoint.Metadata = map[string]string{
+			"first":  "0",
+			"second": "0",
+			"third":  "0",
+		}
+	}
+
+	cm := testClusterManager(clusterConfig)
+	endpoints := cm.store.Config[0].Endpoints
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		endpoint := endpoints[i%len(endpoints)]
+
+		cm.SetEndpoint(clusterName, &model.Endpoint{
+			ID:      endpoint.ID,
+			Address: endpoint.Address,
+			Metadata: map[string]string{
+				"first":  fmt.Sprintf("%d", i),
+				"second": fmt.Sprintf("%d", i),
+				"third":  fmt.Sprintf("%d", i),
+			},
+		})
 	}
 }
 
@@ -178,6 +239,50 @@ func BenchmarkClusterConsistentHashResolve(b *testing.B) {
 				benchmarkEndpointSink = cm.PickEndpoint(clusterName, keys[i%len(keys)])
 			}
 		})
+	}
+}
+
+func BenchmarkClusterConsistentHashSnapshotRefreshUnchangedHealthySet(b *testing.B) {
+	for _, lbType := range []model.LbPolicyType{model.LoadBalancerRingHashing, model.LoadBalancerMaglevHashing} {
+		for _, endpointCount := range []int{1, 32, 256, 1024} {
+			name := fmt.Sprintf("%s/endpoints=%d", lbType, endpointCount)
+			b.Run(name, func(b *testing.B) {
+				b.Run("reuse-cached-previous", func(b *testing.B) {
+					benchmarkConsistentHashSnapshotRefresh(b, lbType, endpointCount, true)
+				})
+				b.Run("rebuild-uncached-previous", func(b *testing.B) {
+					benchmarkConsistentHashSnapshotRefresh(b, lbType, endpointCount, false)
+				})
+			})
+		}
+	}
+}
+
+func benchmarkConsistentHashSnapshotRefresh(
+	b *testing.B,
+	lbType model.LbPolicyType,
+	endpointCount int,
+	previousHashBuilt bool,
+) {
+	config := benchmarkClusterConfig("consistent-hash-refresh", lbType, endpointCount, 0)
+	previous := cluster.NewCluster(config).EndpointSnapshot()
+	if previousHashBuilt {
+		benchmarkConsistentHashSink = previous.HealthyConsistentHash()
+		if benchmarkConsistentHashSink == nil {
+			b.Fatal("expected previous consistent hash")
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		runtimeCluster := cluster.NewClusterWithEndpointSnapshot(config, previous)
+		next := runtimeCluster.EndpointSnapshot()
+		benchmarkConsistentHashSink = next.HealthyConsistentHash()
+	}
+	b.StopTimer()
+	if benchmarkConsistentHashSink == nil {
+		b.Fatal("expected consistent hash")
 	}
 }
 
